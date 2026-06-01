@@ -1,7 +1,8 @@
+name: Build iOS IPA
+
 # Build iOS IPA and upload as Actions artifact.
 # - If secrets.IOS_P12_BASE64 and IOS_PROVISIONING_PROFILE_BASE64 are present, workflow will use them to sign properly.
 # - If those secrets are NOT present, workflow will create a self-signed cert and produce an unsigned .ipa (cannot install on device).
-name: Build iOS IPA
 
 on:
   workflow_dispatch: {}
@@ -10,10 +11,10 @@ on:
       - main
 
 env:
-  # Adjust these values to match your project
-  WORKSPACE: YourApp.xcworkspace    # if using .xcodeproj set PROJECT instead and clear WORKSPACE
-  PROJECT: ""
-  SCHEME: YourAppScheme
+  # Adjust these values to match your project (or leave empty to auto-detect)
+  WORKSPACE: ""    # e.g. "YourApp.xcworkspace"
+  PROJECT: ""      # e.g. "YourApp.xcodeproj"
+  SCHEME: ""       # if empty will try to auto-detect
   EXPORT_METHOD: ad-hoc            # app-store / ad-hoc / enterprise / development
   APP_IDENTIFIER: com.example.YourApp
 
@@ -24,7 +25,7 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
         with:
-          ref: 'Integration'
+          ref: Integration
 
       - name: Show Xcode version
         run: xcodebuild -version
@@ -82,9 +83,36 @@ jobs:
           BUILD_DIR: ${{ github.workspace }}/build
         run: |
           set -e
-          if [ -n "${{ env.WORKSPACE }}" ] && [ -f "${{ env.WORKSPACE }}" ]; then
+          # Auto-detect workspace/project if not provided
+          if [ -z "$WORKSPACE" ] && [ -z "$PROJECT" ]; then
+            WS=$(find . -maxdepth 3 -name "*.xcworkspace" -print -quit || true)
+            if [ -n "$WS" ]; then
+              export WORKSPACE="$WS"
+              echo "Auto-detected workspace: $WORKSPACE"
+            else
+              PROJ=$(find . -maxdepth 3 -name "*.xcodeproj" -print -quit || true)
+              if [ -n "$PROJ" ]; then
+                export PROJECT="$PROJ"
+                echo "Auto-detected project: $PROJECT"
+              fi
+            fi
+          fi
+
+          # Auto-detect scheme if empty
+          if [ -z "$SCHEME" ]; then
+            if [ -n "$WORKSPACE" ]; then
+              SCHEME=$(xcodebuild -workspace "$WORKSPACE" -list 2>/dev/null | awk '/Schemes:/{flag=1;next} flag && NF{print $1; exit}')
+            elif [ -n "$PROJECT" ]; then
+              SCHEME=$(xcodebuild -project "$PROJECT" -list 2>/dev/null | awk '/Schemes:/{flag=1;next} flag && NF{print $1; exit}')
+            fi
+            echo "Auto-detected scheme: $SCHEME"
+          fi
+
+          if [ -n "$WORKSPACE" ] && [ -f "$WORKSPACE" ]; then
+            echo "Building workspace ${WORKSPACE} scheme ${SCHEME}"
             xcodebuild -workspace "$WORKSPACE" -scheme "$SCHEME" -configuration Release -sdk iphoneos -archivePath "$BUILD_DIR/$SCHEME.xcarchive" clean archive
-          elif [ -n "${{ env.PROJECT }}" ] && [ -f "${{ env.PROJECT }}" ]; then
+          elif [ -n "$PROJECT" ] && [ -f "$PROJECT" ]; then
+            echo "Building project ${PROJECT} scheme ${SCHEME}"
             xcodebuild -project "$PROJECT" -scheme "$SCHEME" -configuration Release -sdk iphoneos -archivePath "$BUILD_DIR/$SCHEME.xcarchive" clean archive
           else
             echo "ERROR: WORKSPACE or PROJECT not found. Set env WORKSPACE to .xcworkspace or PROJECT to .xcodeproj."
@@ -134,21 +162,50 @@ jobs:
         run: |
           set -e
           echo "No signing secrets found. Creating a self-signed cert (only local) and producing an unsigned IPA."
+
           # Create temporary keychain
           security create-keychain -p "" build.keychain
           security list-keychains -s ~/Library/Keychains/build.keychain
           security default-keychain -s ~/Library/Keychains/build.keychain
           security unlock-keychain -p "" ~/Library/Keychains/build.keychain || true
-          # Generate self-signed certificate with openssl, import into keychain (for demonstration; will not produce Apple-valid provisioning)
+
+          # Generate self-signed cert and export to PKCS#12 with a NON-EMPTY random password,
+          # then import using that password to avoid MAC verification failure.
+          P12PASS=$(openssl rand -hex 12)
           openssl req -x509 -nodes -days 365 -newkey rsa:2048 -subj "/CN=CI Self Signed" -keyout ci.key -out ci.crt
-          openssl pkcs12 -export -out ci.p12 -inkey ci.key -in ci.crt -passout pass:
-          security import ci.p12 -k ~/Library/Keychains/build.keychain -P "" -T /usr/bin/codesign || true
+          openssl pkcs12 -export -out ci.p12 -inkey ci.key -in ci.crt -passout pass:"$P12PASS"
+          security import ci.p12 -k ~/Library/Keychains/build.keychain -P "$P12PASS" -T /usr/bin/codesign || true
           security set-key-partition-list -S apple-tool:,apple: -s -k "" ~/Library/Keychains/build.keychain || true
 
+          echo "Auto-detecting workspace/project if not set..."
+          if [ -z "$WORKSPACE" ] && [ -z "$PROJECT" ]; then
+            WS=$(find . -maxdepth 3 -name "*.xcworkspace" -print -quit || true)
+            if [ -n "$WS" ]; then
+              export WORKSPACE="$WS"
+              echo "Auto-detected workspace: $WORKSPACE"
+            else
+              PROJ=$(find . -maxdepth 3 -name "*.xcodeproj" -print -quit || true)
+              if [ -n "$PROJ" ]; then
+                export PROJECT="$PROJ"
+                echo "Auto-detected project: $PROJECT"
+              fi
+            fi
+          fi
+
+          # Auto-detect scheme if empty
+          if [ -z "$SCHEME" ]; then
+            if [ -n "$WORKSPACE" ]; then
+              SCHEME=$(xcodebuild -workspace "$WORKSPACE" -list 2>/dev/null | awk '/Schemes:/{flag=1;next} flag && NF{print $1; exit}')
+            elif [ -n "$PROJECT" ]; then
+              SCHEME=$(xcodebuild -project "$PROJECT" -list 2>/dev/null | awk '/Schemes:/{flag=1;next} flag && NF{print $1; exit}')
+            fi
+            echo "Auto-detected scheme: $SCHEME"
+          fi
+
           echo "Archiving without real provisioning (CODE_SIGNING_ALLOWED=NO). This will produce an archive but not a device-installable signed app."
-          if [ -n "${{ env.WORKSPACE }}" ] && [ -f "${{ env.WORKSPACE }}" ]; then
+          if [ -n "${WORKSPACE}" ] && [ -f "${WORKSPACE}" ]; then
             xcodebuild -workspace "$WORKSPACE" -scheme "$SCHEME" -configuration Release -sdk iphoneos -archivePath "$BUILD_DIR/$SCHEME.xcarchive" clean archive CODE_SIGNING_ALLOWED=NO CODE_SIGNING_REQUIRED=NO
-          elif [ -n "${{ env.PROJECT }}" ] && [ -f "${{ env.PROJECT }}" ]; then
+          elif [ -n "${PROJECT}" ] && [ -f "${PROJECT}" ]; then
             xcodebuild -project "$PROJECT" -scheme "$SCHEME" -configuration Release -sdk iphoneos -archivePath "$BUILD_DIR/$SCHEME.xcarchive" clean archive CODE_SIGNING_ALLOWED=NO CODE_SIGNING_REQUIRED=NO
           else
             echo "ERROR: WORKSPACE or PROJECT not found. Set env WORKSPACE to .xcworkspace or PROJECT to .xcodeproj."
@@ -181,6 +238,7 @@ jobs:
           path: |
             build/*.ipa
             build/*.xcarchive
+            build/*-unsigned.ipa
 
       - name: Cleanup keychain
         if: always()
