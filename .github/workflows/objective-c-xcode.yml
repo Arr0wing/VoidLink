@@ -8,7 +8,7 @@ on:
   workflow_dispatch: {}
   push:
     branches:
-      - main
+      - Integration
 
 env:
   # Adjust these values to match your project (or leave empty to auto-detect)
@@ -108,10 +108,10 @@ jobs:
             echo "Auto-detected scheme: $SCHEME"
           fi
 
-          if [ -n "$WORKSPACE" ] && [ -f "$WORKSPACE" ]; then
+          if [ -n "$WORKSPACE" ] && [ -e "$WORKSPACE" ]; then
             echo "Building workspace ${WORKSPACE} scheme ${SCHEME}"
             xcodebuild -workspace "$WORKSPACE" -scheme "$SCHEME" -configuration Release -sdk iphoneos -archivePath "$BUILD_DIR/$SCHEME.xcarchive" clean archive
-          elif [ -n "$PROJECT" ] && [ -f "$PROJECT" ]; then
+          elif [ -n "$PROJECT" ] && [ -e "$PROJECT" ]; then
             echo "Building project ${PROJECT} scheme ${SCHEME}"
             xcodebuild -project "$PROJECT" -scheme "$SCHEME" -configuration Release -sdk iphoneos -archivePath "$BUILD_DIR/$SCHEME.xcarchive" clean archive
           else
@@ -203,9 +203,9 @@ jobs:
           fi
 
           echo "Archiving without real provisioning (CODE_SIGNING_ALLOWED=NO). This will produce an archive but not a device-installable signed app."
-          if [ -n "${WORKSPACE}" ] && [ -f "${WORKSPACE}" ]; then
+          if [ -n "${WORKSPACE}" ] && [ -e "${WORKSPACE}" ]; then
             xcodebuild -workspace "$WORKSPACE" -scheme "$SCHEME" -configuration Release -sdk iphoneos -archivePath "$BUILD_DIR/$SCHEME.xcarchive" clean archive CODE_SIGNING_ALLOWED=NO CODE_SIGNING_REQUIRED=NO
-          elif [ -n "${PROJECT}" ] && [ -f "${PROJECT}" ]; then
+          elif [ -n "${PROJECT}" ] && [ -e "${PROJECT}" ]; then
             xcodebuild -project "$PROJECT" -scheme "$SCHEME" -configuration Release -sdk iphoneos -archivePath "$BUILD_DIR/$SCHEME.xcarchive" clean archive CODE_SIGNING_ALLOWED=NO CODE_SIGNING_REQUIRED=NO
           else
             echo "ERROR: WORKSPACE or PROJECT not found. Set env WORKSPACE to .xcworkspace or PROJECT to .xcodeproj."
