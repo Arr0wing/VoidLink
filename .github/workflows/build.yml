@@ -16,8 +16,79 @@ jobs:
         with:
           ref: 'Integration'
 
-      - name: Checkout submodules
-        run: "git submodule update --init --recursive"
+      - name: Ensure submodules initialized (robust, with fallback)
+        env:
+          SUBMODULES_PAT: ${{ secrets.SUBMODULES_PAT }}  # optional PAT if submodules are private
+        run: |
+          set -euo pipefail
+          echo "Syncing .gitmodules..."
+          git submodule sync --recursive || true
+          # Iterate submodules declared in .gitmodules
+          git config --file .gitmodules --name-only --get-regexp path | awk '{print $2}' | while read -r key; do
+            url=$(git config --file .gitmodules --get submodule.$key.url)
+            path=$(git config --file .gitmodules --get submodule.$key.path)
+            echo "=== Submodule: $key path=$path url=$url ==="
+            if [ -z "$path" ] || [ -z "$url" ]; then
+              echo "Skipping invalid entry"
+              continue
+            fi
+
+            # If path already exists and is a git repo, fetch all refs
+            if [ -d "$path/.git" ]; then
+              echo "Submodule path exists, fetching..."
+              git -C "$path" remote update --prune || git -C "$path" fetch --all --tags || true
+            else
+              # If private and PAT provided, rewrite URL to use PAT (https)
+              if [ -n "${SUBMODULES_PAT:-}" ] && echo "$url" | grep -qE '^https?://'; then
+                AUTH_URL=$(echo "$url" | sed -E "s#https?://#https://${SUBMODULES_PAT}@#")
+                echo "Cloning $AUTH_URL into $path (using PAT)"
+                git clone --no-checkout "$AUTH_URL" "$path" || git clone "$AUTH_URL" "$path"
+              else
+                echo "Cloning $url into $path"
+                git clone --no-checkout "$url" "$path" || git clone "$url" "$path"
+              fi
+            fi
+
+            # Get recorded SHA in superproject for this submodule
+            rec_sha=$(git ls-tree HEAD "$path" 2>/dev/null | awk '{print $3}')
+            echo "Recorded SHA: $rec_sha"
+
+            if [ -n "$rec_sha" ]; then
+              # Try to fetch that SHA explicitly
+              echo "Attempting to fetch recorded SHA $rec_sha in $path"
+              git -C "$path" fetch --no-tags origin "$rec_sha" || true
+              if git -C "$path" cat-file -e "$rec_sha" 2>/dev/null; then
+                echo "Found recorded SHA in submodule, checking it out"
+                git -C "$path" checkout -f "$rec_sha" || git -C "$path" reset --hard "$rec_sha"
+                continue
+              else
+                echo "Recorded SHA not found in remote for $path"
+              fi
+            fi
+
+            # Fallback: try to checkout remote default branch (detect via remote show origin)
+            echo "Falling back to remote default branch for $path"
+            default_branch=$(git -C "$path" remote show origin | sed -n 's/.*HEAD branch: //p' | tr -d '\r' || true)
+            if [ -z "$default_branch" ]; then
+              # common defaults
+              for b in main master; do
+                if git -C "$path" ls-remote --heads origin "$b" | grep -q "$b"; then
+                  default_branch="$b"
+                  break
+                fi
+              done
+            fi
+            if [ -z "$default_branch" ]; then
+              default_branch=main
+            fi
+            echo "Using branch: $default_branch"
+            git -C "$path" fetch --depth=1 origin "$default_branch" || git -C "$path" fetch origin "$default_branch" || true
+            git -C "$path" checkout -B "$default_branch" "origin/$default_branch" || git -C "$path" checkout -B "$default_branch"
+          done
+
+          # Ensure submodules' nested submodules updated as well
+          git submodule update --init --recursive || true
+
 
       - name: Build VoidLink
         run: |
