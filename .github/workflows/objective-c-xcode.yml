@@ -22,10 +22,17 @@ jobs:
   build:
     runs-on: macos-latest
     steps:
-      - name: Checkout
+      - name: Checkout (with submodules)
         uses: actions/checkout@v4
         with:
           ref: Integration
+          submodules: 'recursive'
+          fetch-depth: 0
+
+      - name: Ensure submodules initialized
+        run: |
+          git submodule sync --recursive
+          git submodule update --init --recursive
 
       - name: Show Xcode version
         run: xcodebuild -version
