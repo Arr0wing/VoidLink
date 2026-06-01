@@ -1,32 +1,188 @@
-name: Xcode - Build and Analyze
+# Build iOS IPA and upload as Actions artifact.
+# - If secrets.IOS_P12_BASE64 and IOS_PROVISIONING_PROFILE_BASE64 are present, workflow will use them to sign properly.
+# - If those secrets are NOT present, workflow will create a self-signed cert and produce an unsigned .ipa (cannot install on device).
+name: Build iOS IPA
 
 on:
+  workflow_dispatch: {}
   push:
-    branches: [ "ReadmeBranch" ]
-  pull_request:
-    branches: [ "ReadmeBranch" ]
+    branches:
+      - main
+
+env:
+  # Adjust these values to match your project
+  WORKSPACE: YourApp.xcworkspace    # if using .xcodeproj set PROJECT instead and clear WORKSPACE
+  PROJECT: ""
+  SCHEME: YourAppScheme
+  EXPORT_METHOD: ad-hoc            # app-store / ad-hoc / enterprise / development
+  APP_IDENTIFIER: com.example.YourApp
 
 jobs:
   build:
-    name: Build and analyse default scheme using xcodebuild command
     runs-on: macos-latest
-
     steps:
       - name: Checkout
         uses: actions/checkout@v4
         with:
           ref: 'Integration'
-      - name: Set Default Scheme
+
+      - name: Show Xcode version
+        run: xcodebuild -version
+
+      - name: Install CocoaPods (if needed)
         run: |
-          scheme_list=$(xcodebuild -list -json | tr -d "\n")
-          default=$(echo $scheme_list | ruby -e "require 'json'; puts JSON.parse(STDIN.gets)['project']['targets'][0]")
-          echo $default | cat >default
-          echo Using default scheme: $default
-      - name: Build
+          if [ -f Podfile ]; then
+            sudo gem install cocoapods --no-document || true
+            pod repo update || true
+            pod install --repo-update
+          fi
+
+      - name: Prepare build dir
+        run: mkdir -p build
+
+      - name: Determine signing mode
+        id: signmode
+        run: |
+          if [ -n "${{ secrets.IOS_P12_BASE64 }}" ] && [ -n "${{ secrets.IOS_PROVISIONING_PROFILE_BASE64 }}" ]; then
+            echo "mode=proper" >> $GITHUB_OUTPUT
+          else
+            echo "mode=unsigned" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Proper signing - decode & install certificate and provisioning profile
+        if: steps.signmode.outputs.mode == 'proper'
         env:
-          scheme: ${{ 'default' }}
+          P12_BASE64: ${{ secrets.IOS_P12_BASE64 }}
+          P12_PASSWORD: ${{ secrets.IOS_P12_PASSWORD }}
+          PROFILE_BASE64: ${{ secrets.IOS_PROVISIONING_PROFILE_BASE64 }}
         run: |
-          if [ $scheme = default ]; then scheme=$(cat default); fi
-          if [ "`ls -A | grep -i \\.xcworkspace\$`" ]; then filetype_parameter="workspace" && file_to_build="`ls -A | grep -i \\.xcworkspace\$`"; else filetype_parameter="project" && file_to_build="`ls -A | grep -i \\.xcodeproj\$`"; fi
-          file_to_build=`echo $file_to_build | awk '{$1=$1;print}'`
-          xcodebuild clean build analyze -scheme "$scheme" -"$filetype_parameter" "$file_to_build" | xcpretty && exit ${PIPESTATUS[0]}
+          set -e
+          echo "Setting up keychain and installing p12..."
+          echo "$P12_BASE64" | base64 --decode > certificate.p12
+          security create-keychain -p "" build.keychain
+          security import certificate.p12 -k ~/Library/Keychains/build.keychain -P "$P12_PASSWORD" -T /usr/bin/codesign || true
+          security list-keychains -s ~/Library/Keychains/build.keychain
+          security default-keychain -s ~/Library/Keychains/build.keychain
+          security unlock-keychain -p "" ~/Library/Keychains/build.keychain
+          security set-key-partition-list -S apple-tool:,apple: -s -k "" ~/Library/Keychains/build.keychain || true
+
+          echo "Installing provisioning profile..."
+          echo "$PROFILE_BASE64" | base64 --decode > profile.mobileprovision
+          mkdir -p ~/Library/MobileDevice/Provisioning\ Profiles
+          UUID=$(security cms -D -i profile.mobileprovision 2>/dev/null | /usr/libexec/PlistBuddy -c 'Print:UUID' /dev/stdin 2>/dev/null || true)
+          if [ -n "$UUID" ]; then
+            cp profile.mobileprovision ~/Library/MobileDevice/Provisioning\ Profiles/"$UUID".mobileprovision
+          else
+            cp profile.mobileprovision ~/Library/MobileDevice/Provisioning\ Profiles/profile.mobileprovision
+          fi
+
+      - name: Archive (xcodebuild) — proper signing
+        if: steps.signmode.outputs.mode == 'proper'
+        env:
+          BUILD_DIR: ${{ github.workspace }}/build
+        run: |
+          set -e
+          if [ -n "${{ env.WORKSPACE }}" ] && [ -f "${{ env.WORKSPACE }}" ]; then
+            xcodebuild -workspace "$WORKSPACE" -scheme "$SCHEME" -configuration Release -sdk iphoneos -archivePath "$BUILD_DIR/$SCHEME.xcarchive" clean archive
+          elif [ -n "${{ env.PROJECT }}" ] && [ -f "${{ env.PROJECT }}" ]; then
+            xcodebuild -project "$PROJECT" -scheme "$SCHEME" -configuration Release -sdk iphoneos -archivePath "$BUILD_DIR/$SCHEME.xcarchive" clean archive
+          else
+            echo "ERROR: WORKSPACE or PROJECT not found. Set env WORKSPACE to .xcworkspace or PROJECT to .xcodeproj."
+            exit 1
+          fi
+
+      - name: Create exportOptions.plist (proper)
+        if: steps.signmode.outputs.mode == 'proper'
+        env:
+          EXPORT_METHOD: ${{ env.EXPORT_METHOD }}
+          APP_IDENTIFIER: ${{ env.APP_IDENTIFIER }}
+        run: |
+          cat > exportOptions.plist <<EOF
+          <?xml version="1.0" encoding="UTF-8"?>
+          <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "">
+          <plist version="1.0">
+          <dict>
+            <key>method</key>
+            <string>${EXPORT_METHOD}</string>
+            <key>signingStyle</key>
+            <string>manual</string>
+            <key>compileBitcode</key>
+            <false/>
+            <key>stripSwiftSymbols</key>
+            <true/>
+            <key>provisioningProfiles</key>
+            <dict>
+              <key>${APP_IDENTIFIER}</key>
+              <string>automatic</string>
+            </dict>
+          </dict>
+          </plist>
+          EOF
+
+      - name: Export IPA (proper)
+        if: steps.signmode.outputs.mode == 'proper'
+        env:
+          BUILD_DIR: ${{ github.workspace }}/build
+        run: |
+          set -e
+          xcodebuild -exportArchive -archivePath "$BUILD_DIR/$SCHEME.xcarchive" -exportPath "$BUILD_DIR" -exportOptionsPlist exportOptions.plist
+
+      - name: UNSIGNED path — create self-signed cert and produce unsigned IPA
+        if: steps.signmode.outputs.mode == 'unsigned'
+        env:
+          BUILD_DIR: ${{ github.workspace }}/build
+        run: |
+          set -e
+          echo "No signing secrets found. Creating a self-signed cert (only local) and producing an unsigned IPA."
+          # Create temporary keychain
+          security create-keychain -p "" build.keychain
+          security list-keychains -s ~/Library/Keychains/build.keychain
+          security default-keychain -s ~/Library/Keychains/build.keychain
+          security unlock-keychain -p "" ~/Library/Keychains/build.keychain || true
+          # Generate self-signed certificate with openssl, import into keychain (for demonstration; will not produce Apple-valid provisioning)
+          openssl req -x509 -nodes -days 365 -newkey rsa:2048 -subj "/CN=CI Self Signed" -keyout ci.key -out ci.crt
+          openssl pkcs12 -export -out ci.p12 -inkey ci.key -in ci.crt -passout pass:
+          security import ci.p12 -k ~/Library/Keychains/build.keychain -P "" -T /usr/bin/codesign || true
+          security set-key-partition-list -S apple-tool:,apple: -s -k "" ~/Library/Keychains/build.keychain || true
+
+          echo "Archiving without real provisioning (CODE_SIGNING_ALLOWED=NO). This will produce an archive but not a device-installable signed app."
+          if [ -n "${{ env.WORKSPACE }}" ] && [ -f "${{ env.WORKSPACE }}" ]; then
+            xcodebuild -workspace "$WORKSPACE" -scheme "$SCHEME" -configuration Release -sdk iphoneos -archivePath "$BUILD_DIR/$SCHEME.xcarchive" clean archive CODE_SIGNING_ALLOWED=NO CODE_SIGNING_REQUIRED=NO
+          elif [ -n "${{ env.PROJECT }}" ] && [ -f "${{ env.PROJECT }}" ]; then
+            xcodebuild -project "$PROJECT" -scheme "$SCHEME" -configuration Release -sdk iphoneos -archivePath "$BUILD_DIR/$SCHEME.xcarchive" clean archive CODE_SIGNING_ALLOWED=NO CODE_SIGNING_REQUIRED=NO
+          else
+            echo "ERROR: WORKSPACE or PROJECT not found. Set env WORKSPACE to .xcworkspace or PROJECT to .xcodeproj."
+            exit 1
+          fi
+
+          # Find the .app inside the archive
+          APP_PATH=$(find "$BUILD_DIR/$SCHEME.xcarchive/Products/Applications" -name '*.app' -maxdepth 2 | head -n 1 || true)
+          if [ -z "$APP_PATH" ]; then
+            echo "Could not find built .app in archive. Listing archive contents:"
+            ls -la "$BUILD_DIR/$SCHEME.xcarchive" || true
+            exit 1
+          fi
+          echo "Found app: $APP_PATH"
+
+          mkdir -p "$BUILD_DIR/Payload"
+          cp -R "$APP_PATH" "$BUILD_DIR/Payload/"
+          pushd "$BUILD_DIR" >/dev/null
+          /usr/bin/zip -r "${SCHEME}-unsigned.ipa" Payload > /dev/null
+          popd >/dev/null
+          echo "Unsigned IPA created at $BUILD_DIR/${SCHEME}-unsigned.ipa"
+
+      - name: List produced files
+        run: ls -la build || true
+
+      - name: Upload IPA artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: iOS-IPA
+          path: |
+            build/*.ipa
+            build/*.xcarchive
+
+      - name: Cleanup keychain
+        if: always()
+        run: |
+          security delete-keychain build.keychain || true
